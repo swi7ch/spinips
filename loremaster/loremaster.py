@@ -324,7 +324,7 @@ FULL_DEFAULT_SIZE = (550, 820)
 FULL_MIN_WIDTH = 440
 FULL_MIN_HEIGHT = 520
 FULL_MAX_WIDTH = 820
-FULL_MAX_HEIGHT = 1000
+FULL_MAX_HEIGHT = 10000
 HUD_MORPH_STEPS = 16
 HUD_MORPH_MS = 240
 HUD_MORPH_FRAME_MS = 16
@@ -3735,6 +3735,127 @@ def mez_meter_edge(width, remaining_seconds, duration_seconds,
     return max(0, min(pixel_width, round(pixel_width * fraction)))
 
 
+CONTROL_BAR_LIMIT = 6
+_CONTROL_TONE_RANK = {
+    "critical": 4, "warning": 3, "notice": 2, "lull": 1, "mez": 0,
+}
+
+
+def control_bar_tone(row) -> str:
+    """Color key for one overview timer bar."""
+    state_name = str(getattr(row, "timer_state", "active"))
+    if state_name == "failed" or bool(getattr(row, "last_tick", False)):
+        return "critical"
+    if state_name in {"ambiguous", "unconfirmed"}:
+        return "notice"
+    urgency = str(getattr(row, "urgency", "safe"))
+    if urgency == "critical":
+        return "critical"
+    if urgency == "warning":
+        return "warning"
+    if str(getattr(row, "control_kind", "mez")) == "lull":
+        return "lull"
+    return "mez"
+
+
+def control_section_tone(rows) -> str:
+    """Loudest tone among the bars currently on screen."""
+    tone = "mez"
+    rank = -1
+    for row in rows:
+        current = control_bar_tone(row)
+        current_rank = _CONTROL_TONE_RANK.get(current, 0)
+        if current_rank > rank:
+            tone, rank = current, current_rank
+    return tone
+
+
+def control_bar_fraction(row) -> float:
+    """Remaining share of a confirmed timer; notices and last tick are empty."""
+    if (str(getattr(row, "timer_state", "")) != "active"
+            or bool(getattr(row, "last_tick", False))):
+        return 0.0
+    try:
+        duration = max(0.0, float(row.duration_seconds))
+        remaining = max(0.0, float(row.safe_remaining_seconds))
+    except (TypeError, ValueError, AttributeError):
+        return 0.0
+    if duration <= 0:
+        return 0.0
+    return max(0.0, min(1.0, remaining / duration))
+
+
+def _clip_hud_text(text, limit: int) -> str:
+    compact = " ".join(str(text or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[:max(1, limit - 1)].rstrip() + "…"
+
+
+def control_bar_presentation(row) -> dict:
+    """Copy and fill for one mez or lull bar above the COMBAT accordion."""
+    kind = str(getattr(row, "control_kind", "mez") or "mez").upper()
+    spell = mez_spell_label(
+        str(getattr(row, "spell_name", "") or kind.title()),
+        getattr(row, "rank", 0))
+    state_name = str(getattr(row, "timer_state", "active"))
+    if state_name == "active":
+        title = str(getattr(row, "target_name", "") or "Unknown")
+        try:
+            count = int(getattr(row, "count", 1) or 1)
+        except (TypeError, ValueError):
+            count = 1
+        if count > 1:
+            title = f"{title} ×{count} · EARLIEST"
+        detail = f"{kind} · {spell}"
+        confidence = str(getattr(row, "confidence", "confirmed"))
+        if confidence not in {"confirmed", "exact"}:
+            detail += f" · {confidence.upper()}"
+        elif kind == "LULL":
+            detail += " · EXACT"
+        countdown = format_mez_remaining(
+            float(getattr(row, "safe_remaining_seconds", 0.0) or 0.0),
+            last_tick=bool(getattr(row, "last_tick", False)))
+    else:
+        title = spell
+        detail = str(getattr(row, "ambiguity", "") or state_name)
+        countdown = ("FAILED" if state_name == "failed" else "UNKNOWN")
+    return {
+        "title": _clip_hud_text(title, 46),
+        "detail": _clip_hud_text(detail, 56),
+        "countdown": countdown,
+        "fraction": control_bar_fraction(row),
+        "tone": control_bar_tone(row),
+    }
+
+
+def control_bar_header(snapshot) -> str:
+    """Right-hand count for the overview control section."""
+    try:
+        tracked = int(getattr(snapshot, "active_count", 0) or 0)
+        notices = int(getattr(snapshot, "notice_count", 0) or 0)
+        hidden = int(getattr(snapshot, "hidden_rows", 0) or 0)
+    except (TypeError, ValueError):
+        return "0 TRACKED"
+    parts = [f"{tracked} TRACKED"]
+    if notices:
+        parts.append(f"{notices} UNKNOWN")
+    if hidden:
+        parts.append(f"+{hidden}")
+    return "  ·  ".join(parts)
+
+
+def control_bars_visible(scope, lab_view, row_count) -> bool:
+    """Bars belong on the encounter overview, above COMBAT, and only when live."""
+    try:
+        count = int(row_count)
+    except (TypeError, ValueError):
+        count = 0
+    return (str(scope) == "fight"
+            and str(lab_view or "overview") == "overview"
+            and count > 0)
+
+
 def mez_motion_mix(now, entered_at, urgency_changed_at, urgency,
                    last_tick=False, reduced_motion=False) -> tuple[float, float]:
     """Return bounded glow and one-shot sheen strengths for a timer row."""
@@ -5423,8 +5544,8 @@ def run_gui(args):
         search.focus_set()
 
     def open_settings(_event=None):
-        # Settings opens beside the HUD and may occupy the timer's anchor side.
-        # Keep the control stack quiet until configuration closes.
+        # Crowd control now lives in the overview ledger, so the old
+        # beside-HUD window stays withdrawn while settings is open.
         mez_overlay.hide()
         existing = widgets.get("settings_window")
         if existing:
@@ -5694,7 +5815,8 @@ def run_gui(args):
             fill="x")
         L(frame,
           "Confirmed own-cast landings only. Same-named creatures group into "
-          "one conservative row; LAST TICK accounts for EQ's hidden server-tick phase.",
+          "one conservative row; LAST TICK accounts for EQ's hidden server-tick "
+          "phase. Active timers draw as bars above COMBAT on the encounter overview.",
           fg=T["dim"], font=FONT_S, justify="left", wraplength=410).pack(
               fill="x", pady=(2, 7))
         mez_enabled_var = tk.BooleanVar(value=bool(
@@ -5705,9 +5827,9 @@ def run_gui(args):
             cfg.get("lull_timers_enabled", True)))
         lull_sound_var = tk.BooleanVar(value=bool(
             cfg.get("lull_timer_sound", False)))
-        check("Show mez timers beside the HUD", mez_enabled_var)
+        check("Show mez timer bars on the overview", mez_enabled_var)
         check("Sound once as a mez safe window closes", mez_sound_var)
-        check("Show confirmed lull timers and honest unknown results",
+        check("Show lull timer bars and honest unknown results",
               lull_enabled_var)
         check("Sound once as a lull safe window closes", lull_sound_var)
         mez_warning_row = tk.Frame(frame, bg=T["bg"])
@@ -7246,12 +7368,41 @@ def run_gui(args):
         scroll_bindings["<Button-5>"] = root.bind(
             "<Button-5>", scroll_linux(1), add="+")
 
+        control_surface = tk.Frame(
+            inner, bg=T["void"], highlightbackground=T["line_soft"],
+            highlightthickness=1,
+        )
+        control_head = tk.Frame(control_surface, bg=T["void"])
+        control_head.pack(fill="x", padx=9, pady=(5, 2))
+        control_hex = hex_bullet(control_head, size=12, bg=T["void"])
+        control_hex.pack(side="left", pady=2)
+        L(control_head, "CROWD CONTROL", fg=T["gold"], font=FONT_RUNE,
+          bg=T["void"]).pack(side="left", padx=(7, 0))
+        control_count = L(
+            control_head, "", fg=T["dim"], font=FONT_S, bg=T["void"],
+            anchor="e")
+        control_count.pack(side="right", fill="x", expand=True)
+        control_rule = tk.Frame(control_surface, bg=T["line_soft"], height=1)
+        control_rule.pack(fill="x")
+        control_host = tk.Frame(control_surface, bg=T["void"])
+        control_host.pack(fill="x", padx=9, pady=(2, 4))
+        widgets["control_surface"] = control_surface
+        widgets["control_count"] = control_count
+        widgets["control_hex"] = control_hex
+        widgets["control_hex_tone"] = None
+        widgets["control_rule"] = control_rule
+        widgets["control_host"] = control_host
+        widgets["control_slots"] = []
+        widgets["ledger_anchor"] = None
+
         for key, label in CARDS:
             sect = tk.Frame(
                 inner, bg=T["void"], highlightbackground=T["line_soft"],
                 highlightthickness=1,
             )
             sect.pack(fill="x", pady=(4, 0), padx=1)
+            if widgets["ledger_anchor"] is None:
+                widgets["ledger_anchor"] = sect
             row = tk.Frame(sect, bg=T["void"], cursor="hand2")
             row.pack(fill="x", padx=9, pady=5)
             hb = hex_bullet(row, size=12, bg=T["void"])
@@ -8062,6 +8213,144 @@ def run_gui(args):
                 if "right" in control:
                     _set_text(control["right"], right)
 
+    def control_tone_color(tone):
+        return {
+            "mez": T["cyan"],
+            "lull": T["gold"],
+            "warning": T["gold_bright"],
+            "critical": T["ember"],
+            "notice": T["gold_bright"],
+        }.get(tone, T["cyan"])
+
+    def _draw_control_meter(canvas):
+        try:
+            width = max(1, int(canvas.winfo_width()))
+        except tk.TclError:
+            return
+        fraction = max(0.0, min(1.0, float(
+            getattr(canvas, "_lore_fraction", 0.0))))
+        tone = getattr(canvas, "_lore_tone", "mez")
+        draw_state = (width, round(fraction, 4), tone)
+        if getattr(canvas, "_lore_draw_state", None) == draw_state:
+            return
+        canvas._lore_draw_state = draw_state
+        color = control_tone_color(tone)
+        edge = round(width * fraction)
+        canvas.delete("all")
+        canvas.create_rectangle(0, 1, width, 8, fill=T["meter"], outline="")
+        if edge > 0:
+            canvas.create_rectangle(
+                0, 1, max(2, edge), 8, fill=color, outline="")
+
+    def _new_control_slot():
+        slot = tk.Frame(widgets["control_host"], bg=T["void"])
+        accent = tk.Frame(slot, bg=T["cyan"], width=3)
+        accent.pack_propagate(False)
+        accent.pack(side="left", fill="y", padx=(0, 6))
+        copy = tk.Frame(slot, bg=T["void"])
+        copy.pack(side="left", fill="both", expand=True)
+        top = tk.Frame(copy, bg=T["void"])
+        top.pack(fill="x")
+        countdown = L(
+            top, "", fg=T["cyan"], font=FONT_B, bg=T["void"], anchor="e")
+        countdown.pack(side="right")
+        title = L(top, "", fg=T["parchment"], font=FONT_S, bg=T["void"])
+        title.pack(side="left", fill="x", expand=True)
+        detail = L(copy, "", fg=T["dim"], font=FONT_RUNE_S, bg=T["void"])
+        detail.pack(fill="x")
+        meter = tk.Canvas(
+            copy, height=9, bg=T["void"], highlightthickness=0, bd=0)
+        meter._lore_fraction = 0.0
+        meter._lore_tone = "mez"
+        meter._lore_draw_state = None
+        meter.pack(fill="x", pady=(1, 3))
+        meter.bind(
+            "<Configure>",
+            lambda _e, canvas=meter: _draw_control_meter(canvas))
+        return {
+            "frame": slot, "accent": accent, "title": title,
+            "detail": detail, "countdown": countdown, "meter": meter,
+        }
+
+    def render_control_bars(snapshot):
+        """Draw live mez and lull bars above COMBAT on the overview."""
+        surface = widgets.get("control_surface")
+        if surface is None:
+            return
+        try:
+            if not int(surface.winfo_exists()):
+                return
+        except tk.TclError:
+            return
+        rows = tuple(getattr(snapshot, "rows", ()) or ())
+        show = control_bars_visible(
+            state.get("scope"), state.get("lab_view", "overview"), len(rows))
+        if not show:
+            try:
+                if surface.winfo_manager():
+                    surface.pack_forget()
+            except tk.TclError:
+                pass
+            return
+        anchor = widgets.get("ledger_anchor")
+        try:
+            if anchor is None or not int(anchor.winfo_exists()):
+                return
+            if not surface.winfo_manager():
+                surface.pack(fill="x", pady=(4, 0), padx=1, before=anchor)
+        except tk.TclError:
+            return
+        _set_text(widgets["control_count"], control_bar_header(snapshot))
+        section_tone = control_section_tone(rows)
+        section_color = control_tone_color(section_tone)
+        if widgets.get("control_hex_tone") != section_tone:
+            try:
+                widgets["control_hex"].itemconfigure(
+                    "all", outline=section_color)
+            except tk.TclError:
+                return
+            widgets["control_hex_tone"] = section_tone
+        rule_color = (section_color if section_tone in {
+            "warning", "critical", "notice"} else T["line_soft"])
+        _set_widget(widgets["control_rule"], bg=rule_color)
+        slots = widgets.setdefault("control_slots", [])
+        while len(slots) < len(rows):
+            slots.append(_new_control_slot())
+        for index, slot in enumerate(slots):
+            frame = slot["frame"]
+            if index >= len(rows):
+                try:
+                    if frame.winfo_manager():
+                        frame.pack_forget()
+                except tk.TclError:
+                    continue
+                continue
+            try:
+                if not frame.winfo_manager():
+                    frame.pack(fill="x", pady=(3, 1))
+            except tk.TclError:
+                continue
+            presented = control_bar_presentation(rows[index])
+            bar_color = control_tone_color(presented["tone"])
+            _set_text(slot["title"], presented["title"])
+            _set_widget(
+                slot["detail"], text=presented["detail"],
+                fg=(T["dim"] if presented["tone"] in {"mez", "lull"}
+                    else bar_color))
+            _set_widget(
+                slot["countdown"], text=presented["countdown"], fg=bar_color)
+            _set_widget(slot["accent"], bg=bar_color)
+            meter = slot["meter"]
+            meter._lore_fraction = presented["fraction"]
+            meter._lore_tone = presented["tone"]
+            _draw_control_meter(meter)
+        try:
+            surface.update_idletasks()
+        except tk.TclError:
+            return
+        for slot in slots[:len(rows)]:
+            _draw_control_meter(slot["meter"])
+
     def refresh(force_detail=False):
         # The short Rune Seed morph temporarily replaces the widget tree with
         # a transition canvas.  Let the completed target build own the next
@@ -8087,29 +8376,11 @@ def run_gui(args):
         lull_enabled = bool(cfg.get("lull_timers_enabled", True))
         control_snapshot = merge_control_snapshots(
             mez_snapshot, lull_snapshot,
-            limit=MezTimerOverlay.MAX_ROWS,
+            limit=CONTROL_BAR_LIMIT,
             include_mez=mez_enabled,
             include_lull=lull_enabled,
         )
-        timer_enabled = mez_enabled or lull_enabled
-        settings_window = widgets.get("settings_window")
-        lore_window = wiki_ui.get("win")
-        try:
-            interactive_window_visible = bool(
-                (settings_window and settings_window.winfo_viewable())
-                or (lore_window and lore_window.winfo_viewable()))
-            root_visible = bool(
-                root.winfo_viewable() and root.state() == "normal")
-        except tk.TclError:
-            interactive_window_visible = False
-            root_visible = False
-        hud_visible = not (
-            state["hidden_to_tray"] or z_order.get("window_hidden")
-            or interactive_window_visible
-        ) and root_visible
-        mez_overlay.render(
-            control_snapshot, enabled=timer_enabled, hud_visible=hud_visible,
-            occupied_rects=alerts.occupied_rects())
+        mez_overlay.hide()
         mez_overlay.warning_sound(mez_tracker.pop_warning_events(
             now, threshold_seconds=warning_seconds,
             enabled=(mez_enabled and bool(cfg.get("mez_timer_sound", False))),
@@ -8143,6 +8414,8 @@ def run_gui(args):
             except tk.TclError:
                 pass
             return
+
+        render_control_bars(control_snapshot)
 
         title = snap["character"].upper()
         if snap.get("level"):

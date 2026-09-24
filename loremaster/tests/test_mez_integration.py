@@ -310,5 +310,106 @@ class MezOverlayHelperTests(unittest.TestCase):
         self.assertNotIn("ShowWindow", class_source)
 
 
+def _bar_row(**overrides):
+    from types import SimpleNamespace
+    fields = {
+        "control_kind": "mez",
+        "timer_state": "active",
+        "target_name": "a thought spoiler",
+        "count": 1,
+        "spell_name": "Mesmerize",
+        "rank": 3,
+        "safe_remaining_seconds": 30,
+        "duration_seconds": 60,
+        "last_tick": False,
+        "urgency": "safe",
+        "confidence": "confirmed",
+        "ambiguity": "",
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+class OverviewControlBarTests(unittest.TestCase):
+    def test_safe_mez_bar_is_half_full_and_names_the_target(self):
+        presented = LOREMASTER.control_bar_presentation(_bar_row())
+        self.assertEqual(presented["tone"], "mez")
+        self.assertEqual(presented["fraction"], 0.5)
+        self.assertEqual(presented["countdown"], "30s")
+        self.assertEqual(presented["title"], "a thought spoiler")
+        self.assertEqual(presented["detail"], "MEZ · Mesmerize III")
+
+    def test_grouped_lull_bar_is_exact_and_uses_the_earliest_break(self):
+        presented = LOREMASTER.control_bar_presentation(_bar_row(
+            control_kind="lull", spell_name="Harmony", rank=0,
+            target_name="a wolf", count=2, confidence="exact",
+            safe_remaining_seconds=12, duration_seconds=48))
+        self.assertEqual(presented["tone"], "lull")
+        self.assertEqual(presented["fraction"], 0.25)
+        self.assertEqual(presented["title"], "a wolf ×2 · EARLIEST")
+        self.assertEqual(presented["detail"], "LULL · Harmony · EXACT")
+        self.assertEqual(presented["countdown"], "12s")
+
+    def test_last_tick_empties_the_bar_and_reads_critical(self):
+        presented = LOREMASTER.control_bar_presentation(_bar_row(
+            last_tick=True, urgency="critical", safe_remaining_seconds=1))
+        self.assertEqual(presented["tone"], "critical")
+        self.assertEqual(presented["fraction"], 0.0)
+        self.assertEqual(presented["countdown"], "LAST TICK")
+
+    def test_warning_and_honest_unknown_use_distinct_tones(self):
+        warning = LOREMASTER.control_bar_presentation(_bar_row(
+            urgency="warning", safe_remaining_seconds=8))
+        unknown = LOREMASTER.control_bar_presentation(_bar_row(
+            timer_state="unconfirmed", spell_name="Harmony", rank=0,
+            ambiguity="No landing line followed the cast."))
+        failed = LOREMASTER.control_bar_presentation(_bar_row(
+            timer_state="failed", spell_name="Harmony", rank=0,
+            ambiguity="Resisted."))
+        self.assertEqual(warning["tone"], "warning")
+        self.assertAlmostEqual(warning["fraction"], 8 / 60)
+        self.assertEqual(unknown["tone"], "notice")
+        self.assertEqual(unknown["fraction"], 0.0)
+        self.assertEqual(unknown["countdown"], "UNKNOWN")
+        self.assertIn("No landing line", unknown["detail"])
+        self.assertEqual(failed["countdown"], "FAILED")
+        self.assertEqual(failed["tone"], "critical")
+
+    def test_section_header_counts_tracked_unknown_and_hidden_rows(self):
+        snapshot = _bar_row()
+        snapshot.active_count = 2
+        snapshot.notice_count = 1
+        snapshot.hidden_rows = 3
+        self.assertEqual(
+            LOREMASTER.control_bar_header(snapshot),
+            "2 TRACKED  ·  1 UNKNOWN  ·  +3")
+        self.assertEqual(
+            LOREMASTER.control_section_tone((
+                _bar_row(),
+                _bar_row(control_kind="lull"),
+                _bar_row(urgency="warning"),
+            )),
+            "warning")
+
+    def test_bars_show_only_on_the_encounter_overview(self):
+        visible = LOREMASTER.control_bars_visible
+        self.assertTrue(visible("fight", "overview", 1))
+        self.assertFalse(visible("fight", "damage", 2))
+        self.assertFalse(visible("fight", "healing", 2))
+        self.assertFalse(visible("session", "overview", 2))
+        self.assertFalse(visible("records", "overview", 2))
+        self.assertFalse(visible("fight", "overview", 0))
+
+    def test_refresh_draws_overview_bars_and_leaves_the_side_window_hidden(self):
+        source = (LOREMASTER_DIR / "loremaster.py").read_text(encoding="utf-8")
+        refresh = source[source.index("    def refresh("):
+                         source.index("    z_order = ")]
+        self.assertIn("render_control_bars(control_snapshot)", refresh)
+        self.assertIn("mez_overlay.hide()", refresh)
+        self.assertNotIn("mez_overlay.render(", refresh)
+        self.assertIn("Show mez timer bars on the overview", source)
+        self.assertNotIn("Show mez timers beside the HUD", source)
+
+
 if __name__ == "__main__":
     unittest.main()
