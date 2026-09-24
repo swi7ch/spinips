@@ -3519,7 +3519,8 @@ class AlertManager:
         except Exception:
             pass
 
-    def show(self, severity, text_msg, sound_kind=None, sound=None):
+    def show(self, severity, text_msg, sound_kind=None, sound=None, *,
+             audible=True):
         tk = self.tk
         if len(self.active) >= 3:
             self._cancel_and_destroy(self.active[0])
@@ -3589,9 +3590,10 @@ class AlertManager:
                 self.on_show(severity, text_msg)
             except Exception:
                 pass
-        if sound_kind is None:
-            sound_kind = sound_kind_for_alert("", text_msg)
-        self._beep(severity, sound_kind, sound=sound)
+        if audible:
+            if sound_kind is None:
+                sound_kind = sound_kind_for_alert("", text_msg)
+            self._beep(severity, sound_kind, sound=sound)
         if not self._show_nonactivating(win, floating, rect=native_rect):
             self._cancel_and_destroy(win)
             return
@@ -7878,8 +7880,13 @@ def run_gui(args):
             if (fight_toasts_active(cfg) and done > state["fights_seen"]
                     and stats.fights):
                 f = stats.fights[-1]
-                alerts.show("info", f"{f.name}  \u2014  {fmt_num(f.dps)} dps  "
-                            f"({fmt_num(f.damage)} in {fmt_dur(f.seconds)})")
+                # This recap fires once combat has been quiet for the same
+                # 10 seconds that flips the log badge from LIVE to READY.
+                # It is a summary, so it stays on screen and does not cue.
+                alerts.show(
+                    "info", f"{f.name}  \u2014  {fmt_num(f.dps)} dps  "
+                    f"({fmt_num(f.damage)} in {fmt_dur(f.seconds)})",
+                    audible=False)
             state["fights_seen"] = done
 
             now_mono = time.monotonic()
