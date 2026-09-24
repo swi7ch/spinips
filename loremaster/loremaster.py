@@ -325,6 +325,9 @@ FULL_MIN_WIDTH = 440
 FULL_MIN_HEIGHT = 520
 FULL_MAX_WIDTH = 820
 FULL_MAX_HEIGHT = 10000
+# The ledger may shrink to this requested height. Anything shorter clips the
+# footer, and with it the only resize grip.
+LEDGER_MIN_HEIGHT = 120
 HUD_MORPH_STEPS = 16
 HUD_MORPH_MS = 240
 HUD_MORPH_FRAME_MS = 16
@@ -3075,6 +3078,36 @@ def fit_panel_size_to_bounds(requested_size, scale, bounds, margin=8):
     return min(ideal_width, available_width), min(ideal_height, available_height)
 
 
+def expanded_panel_minimum(content_height, footer_width, scale=1.0):
+    """Smallest expanded HUD that still shows the footer grip and its buttons."""
+    try:
+        scale_value = max(1.0, min(1.40, float(scale)))
+    except (TypeError, ValueError):
+        scale_value = 1.0
+    try:
+        height = int(content_height)
+    except (TypeError, ValueError):
+        height = FULL_MIN_HEIGHT
+    try:
+        footer = int(footer_width)
+    except (TypeError, ValueError):
+        footer = 0
+    width = max(int(FULL_MIN_WIDTH * scale_value), footer, 1)
+    height = max(int(FULL_MIN_HEIGHT * scale_value), height, 1)
+    return width, height
+
+
+def clamp_panel_resize(proposed, minimum, maximum):
+    """Clamp one edge, never letting a short screen hide the resize grip."""
+    try:
+        size = int(proposed)
+        floor = max(1, int(minimum))
+        ceiling = max(1, int(maximum))
+    except (TypeError, ValueError):
+        return max(1, FULL_MIN_WIDTH)
+    return min(max(size, floor), max(ceiling, floor))
+
+
 def adjacent_window_position(root_rect, window_size, bounds, gap=16):
     """Place a secondary surface beside its owner inside one monitor."""
     rx, ry, rw, _rh = (int(value) for value in root_rect)
@@ -4866,6 +4899,32 @@ def run_gui(args):
 
         show_frame()
 
+    def apply_full_resize_floor():
+        """Keep the footer grip and its buttons inside the expanded window."""
+        if state.get("mini") or state.get("closing"):
+            return
+        try:
+            root.update_idletasks()
+            footer = widgets.get("footer")
+            footer_width = 0
+            if footer is not None and int(footer.winfo_exists()):
+                footer_width = int(footer.winfo_reqwidth()) + 4
+            minimum_width, minimum_height = expanded_panel_minimum(
+                root.winfo_reqheight(), footer_width, max(1.0, font_scale))
+        except (tk.TclError, TypeError, ValueError):
+            return
+        state["full_min_size"] = (minimum_width, minimum_height)
+        try:
+            root.minsize(minimum_width, minimum_height)
+            width = max(minimum_width, int(root.winfo_width()))
+            height = max(minimum_height, int(root.winfo_height()))
+            if (width != int(root.winfo_width())
+                    or height != int(root.winfo_height())):
+                root.geometry(
+                    f"{width}x{height}{root.winfo_x():+d}{root.winfo_y():+d}")
+        except tk.TclError:
+            pass
+
     def start_resize(e):
         if state["locked"] or state["click_through"]:
             return "break"
@@ -4884,8 +4943,13 @@ def run_gui(args):
         if (state["locked"] or state["click_through"]
                 or not resize.get("active")):
             return "break"
-        minimum_width = int(FULL_MIN_WIDTH * max(1.0, font_scale))
-        minimum_height = int(FULL_MIN_HEIGHT * max(1.0, font_scale))
+        floor = state.get("full_min_size")
+        if not floor:
+            scale = max(1.0, font_scale)
+            floor = expanded_panel_minimum(
+                int(FULL_MIN_HEIGHT * scale), int(FULL_MIN_WIDTH * scale),
+                scale)
+        minimum_width, minimum_height = floor
         bounds = monitor_work_area(root, (
             root.winfo_x(), root.winfo_y(), root.winfo_width(),
             root.winfo_height()))
@@ -4894,12 +4958,12 @@ def run_gui(args):
         available_height = max(1, vy + vh - root.winfo_y() - 8)
         maximum_width = min(FULL_MAX_WIDTH, available_width)
         maximum_height = min(FULL_MAX_HEIGHT, available_height)
-        effective_min_width = min(minimum_width, maximum_width)
-        effective_min_height = min(minimum_height, maximum_height)
-        width = max(effective_min_width, min(
-            maximum_width, resize["w"] + e.x_root - resize["x"]))
-        height = max(effective_min_height, min(
-            maximum_height, resize["h"] + e.y_root - resize["y"]))
+        width = clamp_panel_resize(
+            resize["w"] + e.x_root - resize["x"],
+            minimum_width, maximum_width)
+        height = clamp_panel_resize(
+            resize["h"] + e.y_root - resize["y"],
+            minimum_height, maximum_height)
         resize["pending"] = (width, height)
         if resize.get("after_id") is None:
             resize["after_id"] = root.after(16, flush_resize)
@@ -7098,6 +7162,7 @@ def run_gui(args):
             _set_text(restore_label, summary_toggle_label(True))
         save_config(cfg)
         refresh(force_detail=True)
+        apply_full_resize_floor()
 
     def stop_seed_motion():
         pending = state.get("seed_motion_after")
@@ -7334,7 +7399,10 @@ def run_gui(args):
         widgets["ledger_wrap"] = wrap
         apply_summary_visibility(
             top_summary, summary_restore, wrap, state["summary_collapsed"])
-        canvas = tk.Canvas(wrap, bg=T["bg"], highlightthickness=0, width=520)
+        canvas = tk.Canvas(
+            wrap, bg=T["bg"], highlightthickness=0, width=520,
+            height=max(LEDGER_MIN_HEIGHT, int(round(
+                LEDGER_MIN_HEIGHT * max(1.0, font_scale)))))
         vsb = tk.Scrollbar(wrap, orient="vertical", command=canvas.yview,
                            troughcolor=T["bg"], bg=T["raised"], width=8)
         inner = tk.Frame(canvas, bg=T["bg"])
@@ -7480,6 +7548,7 @@ def run_gui(args):
 
         footer = tk.Frame(body, bg=T["panel"])
         footer.pack(fill="x")
+        widgets["footer"] = footer
         widgets["status"] = L(footer, "Loremaster awaits your log\u2026",
                               fg=T["dim"], font=FONT_S, bg=T["panel"])
         widgets["status"].pack(fill="x", padx=10, pady=(5, 2))
@@ -7519,6 +7588,7 @@ def run_gui(args):
         width, height, x, y = target_geometry_for_mode(False)
         root.geometry(f"{width}x{height}{x:+d}{y:+d}")
         refresh(force_detail=True)
+        apply_full_resize_floor()
 
     def build_mini():
         stop_seed_motion()
@@ -7624,6 +7694,10 @@ def run_gui(args):
         seed.bind("<Button-3>", open_settings)
 
         _width, _height, x, y = target_geometry_for_mode(True)
+        try:
+            root.minsize(mini_width, mini_height)
+        except tk.TclError:
+            pass
         root.geometry(f"{mini_width}x{mini_height}{x:+d}{y:+d}")
         root.update_idletasks()
         set_capsule_window_region(True, mini_width, mini_height)
@@ -7744,6 +7818,15 @@ def run_gui(args):
                 return
             swapped["done"] = True
             width, height, x, y = target
+            try:
+                # Drop the expanded floor before the seed geometry is applied,
+                # or Tk keeps the window tall enough to hide the rune.
+                if target_mini:
+                    root.minsize(width, height)
+                else:
+                    root.minsize(1, 1)
+            except tk.TclError:
+                pass
             root.geometry(f"{width}x{height}{x:+d}{y:+d}")
             state["mini"] = target_mini
             cfg["mini_mode"] = target_mini

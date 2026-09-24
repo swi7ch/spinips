@@ -421,6 +421,18 @@ class RuneSeedGeometryTests(unittest.TestCase):
         self.assertLessEqual(height, 712)
         self.assertEqual((width, height), (616, 712))
 
+    def test_resize_floor_keeps_the_footer_grip_reachable(self):
+        width, height = LOREMASTER.expanded_panel_minimum(653, 339, 1.0)
+        self.assertEqual(width, LOREMASTER.FULL_MIN_WIDTH)
+        self.assertEqual(height, 653)
+        wide, tall = LOREMASTER.expanded_panel_minimum(751, 700, 1.4)
+        self.assertEqual(wide, 700)
+        self.assertEqual(tall, 751)
+        self.assertGreaterEqual(
+            LOREMASTER.clamp_panel_resize(400, 653, 500), 653)
+        self.assertEqual(LOREMASTER.clamp_panel_resize(900, 653, 820), 820)
+        self.assertEqual(LOREMASTER.clamp_panel_resize(700, 653, 1000), 700)
+
     def test_expanded_panel_keeps_its_design_size_when_space_allows(self):
         self.assertEqual(
             LOREMASTER.fit_panel_size_to_bounds(
