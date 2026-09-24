@@ -79,6 +79,28 @@ class AlertTriggerGatingTests(unittest.TestCase):
         self.assertEqual(LOREMASTER.check_alerts(
             "summoned", {}, "", "Soandso", cfg), [])
 
+    def test_custom_rule_keeps_its_sound_without_changing_the_banner_pair(self):
+        cfg = base_cfg(custom_alerts=[
+            {"pattern": "Rampage", "text": "RAMPAGE", "severity": "danger",
+             "sound": " /tmp/rampage.wav "},
+            {"pattern": "sneeze", "text": "SNEEZE", "severity": "info"},
+        ])
+        rampage = LOREMASTER.check_alerts(
+            "", {}, "The dragon uses Rampage!", "Soandso", cfg)
+        self.assertEqual(rampage, [("danger", "RAMPAGE")])
+        self.assertEqual(rampage[0].sound, "/tmp/rampage.wav")
+        sneeze = LOREMASTER.check_alerts(
+            "", {}, "You sneeze.", "Soandso", cfg)
+        self.assertEqual(sneeze, [("info", "SNEEZE")])
+        self.assertIsNone(sneeze[0].sound)
+        charm = LOREMASTER.CharmBreakEvent(
+            event_id=1, pet_name="A rock golem",
+            charm_spell="Cajoling Whispers", occurred_at=datetime.now())
+        builtin = LOREMASTER.check_alerts(
+            "spell_fade", {}, "", "Soandso", base_cfg(), (charm,))
+        self.assertEqual(builtin, [("danger", "CHARM BROKE — A ROCK GOLEM")])
+        self.assertIsNone(getattr(builtin[0], "sound", None))
+
     def test_disabling_one_trigger_leaves_the_others_alone(self):
         cfg = base_cfg(alert_big_hit=False)
         self.assertEqual(LOREMASTER.check_alerts(

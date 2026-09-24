@@ -541,12 +541,12 @@ Advanced users can add regular-expression rules to `%LOCALAPPDATA%\SpinsLoremast
 
 ```json
 "custom_alerts": [
-  {"pattern": "begins to cast a spell", "text": "MOB CASTING", "severity": "warn"},
-  {"pattern": "Rampage", "text": "RAMPAGE", "severity": "danger"}
+  {"pattern": "begins to cast a spell", "text": "MOB CASTING", "severity": "warn", "sound": "ember"},
+  {"pattern": "Rampage", "text": "RAMPAGE", "severity": "danger", "sound": "/home/you/sounds/rampage.wav"}
 ]
 ```
 
-Invalid patterns are reported once when the config loads and are ignored safely per log line.
+`sound` is optional. Leave it out and the rule uses the general alert cue. Set it to a studio preset (`rune`, `crystal`, `ember`, `bell`, `silent`, or the label such as `Temple Bell`) or to a WAV, MP3, OGG, or M4A file on this computer. A missing or unplayable file falls back to a preset cue. Invalid patterns are reported once when the config loads and are ignored safely per log line.
 
 ### Accessibility
 

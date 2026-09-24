@@ -58,6 +58,19 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from alert_sounds import (
+    PRESET_CHOICES,
+    PRESET_LABELS,
+    SOUND_KIND_ROWS,
+    AlertNotice,
+    normalize_sound_profiles,
+    play_alert_sound,
+    preview_severity,
+    profile_for_custom_sound,
+    sound_kind_for_alert,
+    stop_alert_playback,
+    validated_custom_path,
+)
 from charm_break import CharmBreakDetector, CharmBreakEvent
 from control_snapshot import merge_control_snapshots
 from hover_ocr import HoverOcrService
@@ -2528,7 +2541,10 @@ def check_alerts(kind: str, g: dict, raw_msg: str, character: str, cfg: dict,
     for rule in cfg.get("custom_alerts", []):
         try:
             if re.search(rule.get("pattern", "$^"), raw_msg or ""):
-                out.append((rule.get("severity", "info"), rule.get("text", raw_msg)[:80]))
+                out.append(AlertNotice(
+                    rule.get("severity", "info"),
+                    rule.get("text", raw_msg)[:80],
+                    rule.get("sound")))
         except re.error:
             continue
     return out
@@ -2588,6 +2604,8 @@ def load_config() -> dict:
         "alert_charm_break": True,
         "alert_big_hit": True,
         "alert_name_called": True,
+        # Per-event cues. Normalized to the studio defaults after the file loads.
+        "sound_profiles": {},
         # Mez timers are a separate, always-honest control surface. Sound is
         # opt-in so enabling the visual does not make a previously quiet HUD
         # noisy; the warning fires once as the guaranteed-safe window closes.
@@ -2697,6 +2715,7 @@ def load_config() -> dict:
     cfg["hud_cards_version"] = RUNE_SEED_CONFIG_VERSION
     cfg["mini_alert_anchor"] = normalize_alert_anchor(
         cfg.get("mini_alert_anchor", "auto"))
+    cfg["sound_profiles"] = normalize_sound_profiles(cfg.get("sound_profiles"))
     cfg["ui_theme"] = ("glass" if str(cfg.get("ui_theme", "vellum")).casefold()
                        == "glass" else "vellum")
     if not isinstance(cfg.get("sky_owned_items"), list):
@@ -3487,20 +3506,20 @@ class AlertManager:
             win, 50,
             lambda: self._animate_icon(win, icon, edge, bright, step + 1))
 
-    def _beep(self, severity):
+    def _beep(self, severity, sound_kind="default", sound=None):
         if not self.cfg.get("alert_sound", True):
             return
         try:
-            import winsound
-            winsound.MessageBeep(
-                winsound.MB_ICONHAND if severity == "danger" else winsound.MB_ICONASTERISK)
+            profile = profile_for_custom_sound(sound)
+            if profile is None:
+                profiles = normalize_sound_profiles(self.cfg.get("sound_profiles"))
+                kind = sound_kind if sound_kind in profiles else "default"
+                profile = profiles[kind]
+            play_alert_sound(profile, severity, bell=self.root.bell)
         except Exception:
-            try:
-                self.root.bell()
-            except Exception:
-                pass
+            pass
 
-    def show(self, severity, text_msg):
+    def show(self, severity, text_msg, sound_kind=None, sound=None):
         tk = self.tk
         if len(self.active) >= 3:
             self._cancel_and_destroy(self.active[0])
@@ -3570,7 +3589,9 @@ class AlertManager:
                 self.on_show(severity, text_msg)
             except Exception:
                 pass
-        self._beep(severity)
+        if sound_kind is None:
+            sound_kind = sound_kind_for_alert("", text_msg)
+        self._beep(severity, sound_kind, sound=sound)
         if not self._show_nonactivating(win, floating, rect=native_rect):
             self._cancel_and_destroy(win)
             return
@@ -4178,19 +4199,17 @@ class MezTimerOverlay:
             return
         self._start_animation()
 
-    def warning_sound(self, events, *, enabled=None):
+    def warning_sound(self, events, *, enabled=None, sound_kind="mez"):
         if enabled is None:
             enabled = self.cfg.get("mez_timer_sound", False)
         if not events or not enabled:
             return
+        profiles = normalize_sound_profiles(self.cfg.get("sound_profiles"))
+        kind = sound_kind if sound_kind in profiles else "mez"
         try:
-            import winsound
-            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+            play_alert_sound(profiles[kind], "warn", bell=self.root.bell)
         except Exception:
-            try:
-                self.root.bell()
-            except Exception:
-                pass
+            pass
 
     def sync_topmost(self, floating):
         if self.win is None:
@@ -5713,7 +5732,9 @@ def run_gui(args):
           font=FONT_B).pack(fill="x")
         bad_patterns = invalid_custom_alert_patterns(cfg.get("custom_alerts", []))
         alerts_blurb = ("DBM-style banners driven by your own log lines. "
-                        "Pick which triggers fire and how long banners stay up.")
+                        "Pick which triggers fire and how long banners stay up. "
+                        "A custom rule in the config can set sound to a preset "
+                        "name or an audio file.")
         if bad_patterns:
             alerts_blurb += (f" NOTE: {len(bad_patterns)} custom alert "
                              "pattern(s) in the config file are invalid regex "
@@ -5787,14 +5808,150 @@ def run_gui(args):
                          wraplength=410)
         alert_status.pack(fill="x", pady=(6, 0))
 
+        draft_profiles = normalize_sound_profiles(cfg.get("sound_profiles"))
+        preset_ids = {label: preset_id for preset_id, label in PRESET_CHOICES}
+        preset_vars = {}
+        file_buttons = {}
+        studio_guard = {"busy": False}
+
+        tk.Frame(alerts_frame, bg=T["line_soft"], height=1).pack(
+            fill="x", pady=(12, 10))
+        L(alerts_frame, "ALERT SOUND STUDIO", fg=T["cyan"],
+          font=FONT_B).pack(fill="x")
+        L(alerts_frame,
+          "Give each alert its own cue. Presets are generated on this "
+          "computer. A custom WAV, MP3, OGG, or M4A file stays where you "
+          "picked it and must be 8 MB or smaller. A missing file, or one "
+          "this computer cannot play, falls back to a preset cue.",
+          fg=T["dim"], font=FONT_S, justify="left", wraplength=410).pack(
+              fill="x", pady=(2, 4))
+
+        def sound_file_caption(path):
+            name = Path(path).name if path else "Choose an audio file"
+            if len(name) > 46:
+                return name[:22] + "\u2026" + name[-20:]
+            return name
+
+        def set_preset_var(kind, preset_id):
+            studio_guard["busy"] = True
+            try:
+                preset_vars[kind].set(PRESET_LABELS[preset_id])
+            finally:
+                studio_guard["busy"] = False
+
+        def sync_sound_file_button(kind):
+            button = file_buttons[kind]
+            profile = draft_profiles[kind]
+            if profile["preset"] != "custom":
+                if button.winfo_manager():
+                    button.pack_forget()
+                return
+            button.configure(text=sound_file_caption(profile["custom_path"]))
+            if not button.winfo_manager():
+                button.pack(fill="x", pady=(2, 0))
+
+        def choose_custom_sound(kind, revert_on_cancel):
+            from tkinter import filedialog
+            profile = draft_profiles[kind]
+            previous = profile["preset"]
+            selected = filedialog.askopenfilename(
+                parent=win,
+                title="Choose a Loremaster alert sound",
+                filetypes=(
+                    ("Audio", "*.wav *.mp3 *.ogg *.m4a"),
+                    ("All files", "*.*"),
+                ),
+            )
+            if not selected:
+                if revert_on_cancel:
+                    set_preset_var(kind, previous)
+                return
+            checked = validated_custom_path(selected)
+            if checked is None:
+                if revert_on_cancel:
+                    set_preset_var(kind, previous)
+                alert_status.configure(
+                    text="Choose a WAV, MP3, OGG, or M4A file up to 8 MB.",
+                    fg=T["hp"])
+                return
+            profile["preset"] = "custom"
+            profile["custom_path"] = str(checked)
+            set_preset_var(kind, "custom")
+            sync_sound_file_button(kind)
+            alert_status.configure(
+                text=f"Custom sound: {checked.name}", fg=T["green"])
+
+        def apply_preset_choice(kind):
+            if studio_guard["busy"]:
+                return
+            preset_id = preset_ids.get(preset_vars[kind].get(), "rune")
+            profile = draft_profiles[kind]
+            if preset_id == "custom" and not profile["custom_path"]:
+                win.after(1, lambda kind=kind: choose_custom_sound(
+                    kind, revert_on_cancel=True))
+                return
+            profile["preset"] = preset_id
+            sync_sound_file_button(kind)
+
+        def preview_sound(kind):
+            play_alert_sound(
+                draft_profiles[kind], preview_severity(kind), bell=root.bell)
+
+        for kind, label, detail in SOUND_KIND_ROWS:
+            block = tk.Frame(alerts_frame, bg=T["bg"])
+            block.pack(fill="x", pady=(5, 0))
+            row = tk.Frame(block, bg=T["bg"])
+            row.pack(fill="x")
+            copy = tk.Frame(row, bg=T["bg"])
+            copy.pack(side="left", fill="x", expand=True)
+            L(copy, label, fg=T["text"], font=FONT_S).pack(anchor="w")
+            L(copy, detail, fg=T["dim"], font=FONT_RUNE_S).pack(anchor="w")
+            variable = tk.StringVar(
+                value=PRESET_LABELS[draft_profiles[kind]["preset"]])
+            preset_vars[kind] = variable
+            menu = tk.OptionMenu(
+                row, variable, *[choice for _preset_id, choice in PRESET_CHOICES],
+                command=lambda _choice, kind=kind: apply_preset_choice(kind))
+            menu.configure(
+                bg=T["panel"], fg=T["text"],
+                activebackground=T["raised"], activeforeground=T["gold_bright"],
+                relief="flat", highlightthickness=0, bd=0,
+                font=FONT_S, anchor="w")
+            try:
+                menu["menu"].configure(
+                    bg=T["void"], fg=T["text"],
+                    activebackground=T["raised"],
+                    activeforeground=T["gold_bright"],
+                    font=FONT_S, relief="flat", bd=0)
+            except tk.TclError:
+                pass
+            menu.pack(side="left", padx=(8, 0))
+            tk.Button(
+                row, text="PLAY",
+                command=lambda kind=kind: preview_sound(kind),
+                bg=T["raised"], fg=T["cyan"], activebackground=T["panel"],
+                relief="flat", font=FONT_RUNE, padx=8, pady=2,
+            ).pack(side="left", padx=(4, 0))
+            file_button = tk.Button(
+                block, text="Choose an audio file",
+                command=lambda kind=kind: choose_custom_sound(
+                    kind, revert_on_cancel=False),
+                bg=T["panel"], fg=T["gold_bright"],
+                activebackground=T["raised"], relief="flat",
+                font=FONT_RUNE, padx=6, pady=2)
+            file_buttons[kind] = file_button
+            sync_sound_file_button(kind)
+
         def test_alert():
             # Preview with the on-screen sound/duration/placement choices,
             # without requiring a save first.
             previous = {"alert_sound": cfg.get("alert_sound", True),
                         "alert_seconds": cfg.get("alert_seconds", 4),
                         "mini_alert_anchor": cfg.get(
-                            "mini_alert_anchor", "auto")}
+                            "mini_alert_anchor", "auto"),
+                        "sound_profiles": cfg.get("sound_profiles")}
             cfg["alert_sound"] = bool(sound_var.get())
+            cfg["sound_profiles"] = draft_profiles
             cfg["mini_alert_anchor"] = normalize_alert_anchor(
                 alert_anchor_var.get())
             try:
@@ -5802,7 +5959,9 @@ def run_gui(args):
             except (TypeError, ValueError):
                 pass
             try:
-                alerts.show("info", "TEST ALERT — this is how alerts look")
+                alerts.show(
+                    "info", "TEST ALERT — this is how alerts look",
+                    sound_kind="default")
             finally:
                 cfg.update(previous)
 
@@ -5898,7 +6057,8 @@ def run_gui(args):
                        big_hit_threshold=threshold_value,
                        alert_seconds=seconds_value,
                        mini_alert_anchor=normalize_alert_anchor(
-                           alert_anchor_var.get()))
+                           alert_anchor_var.get()),
+                       sound_profiles=normalize_sound_profiles(draft_profiles))
             wiki_client.network_enabled = cfg["wiki_network_enabled"]
             save_config(cfg)
             threshold_entry.delete(0, "end")
@@ -7589,6 +7749,7 @@ def run_gui(args):
         if state["closing"]:
             return
         state["closing"] = True
+        stop_alert_playback()
         for callback_key in (
                 "morph_after", "mini_save_after", "seed_motion_after"):
             pending = state.get(callback_key)
@@ -7673,10 +7834,14 @@ def run_gui(args):
             if kind == "composition" and stats.composition:
                 remember_composition(cfg, stats.character, stats.composition)
                 save_config(cfg)
-        for severity, text_msg in check_alerts(
+        for alert in check_alerts(
                 kind, groups, raw_msg, stats.character, cfg,
                 charm_break_events):
-            alerts.show(severity, text_msg)
+            severity, text_msg = alert[0], alert[1]
+            alerts.show(
+                severity, text_msg,
+                sound_kind=sound_kind_for_alert(kind, text_msg),
+                sound=getattr(alert, "sound", None))
 
     def tick():
         if state["closing"]:
@@ -7941,11 +8106,13 @@ def run_gui(args):
         mez_overlay.warning_sound(mez_tracker.pop_warning_events(
             now, threshold_seconds=warning_seconds,
             enabled=(mez_enabled and bool(cfg.get("mez_timer_sound", False))),
-        ), enabled=(mez_enabled and bool(cfg.get("mez_timer_sound", False))))
+        ), enabled=(mez_enabled and bool(cfg.get("mez_timer_sound", False))),
+            sound_kind="mez")
         mez_overlay.warning_sound(lull_tracker.pop_warning_events(
             now, threshold_seconds=lull_warning_seconds,
             enabled=(lull_enabled and bool(cfg.get("lull_timer_sound", False))),
-        ), enabled=(lull_enabled and bool(cfg.get("lull_timer_sound", False))))
+        ), enabled=(lull_enabled and bool(cfg.get("lull_timer_sound", False))),
+            sound_kind="lull")
         if state["mini"]:
             seed = widgets.get("mini_seed")
             if not seed:
